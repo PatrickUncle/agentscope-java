@@ -93,6 +93,7 @@ import io.agentscope.core.model.ExecutionConfig;
 import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.model.ModelRegistry;
+import io.agentscope.core.model.PartialStreamContent;
 import io.agentscope.core.model.ToolSchema;
 import io.agentscope.core.permission.PermissionBehavior;
 import io.agentscope.core.permission.PermissionContextState;
@@ -132,6 +133,7 @@ import io.agentscope.core.util.JsonSchemaUtils;
 import io.agentscope.core.util.JsonUtils;
 import io.agentscope.core.util.MessageUtils;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -144,6 +146,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
@@ -157,6 +160,7 @@ import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 import reactor.util.context.Context;
+import reactor.util.retry.Retry;
 
 /**
  * ReAct (Reasoning and Acting) Agent implementation.
@@ -2505,13 +2509,37 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
 
             StringBuilder transformedText = new StringBuilder();
             AtomicBoolean sawTransformedTextDelta = new AtomicBoolean(false);
+            Model model = modelForCall();
             return MiddlewareChain.build(
                             middlewares,
                             ReActAgent.this,
                             rc,
                             MiddlewareBase::onModelCall,
                             modelCallCore)
-                    .apply(new ModelCallInput(messages, tools, options, modelForCall()))
+                    .apply(new ModelCallInput(messages, tools, options, model))
+                    // A stream the provider terminated abnormally (no [DONE] sentinel and
+                    // no finish_reason chunk) is retried once with a clean slate: the
+                    // reasoning accumulators and the text-transform buffer are reset
+                    // before re-subscription, and the retried attempt re-emits
+                    // ModelCallStartEvent with attempt > 1 so downstream consumers drop
+                    // the partial content of the aborted attempt instead of duplicating
+                    // it. Blind re-subscription without these resets would concatenate
+                    // both attempts' text.
+                    .retryWhen(
+                            Retry.fixedDelay(1, Duration.ofSeconds(1))
+                                    .filter(ex -> ex instanceof PartialStreamContent)
+                                    .doBeforeRetry(
+                                            signal -> {
+                                                log.warn(
+                                                        "Model stream ended abnormally"
+                                                                + " (model={}), retrying once"
+                                                                + " with reset accumulators: {}",
+                                                        model.getModelName(),
+                                                        signal.failure().getMessage());
+                                                context.resetStreamState();
+                                                transformedText.setLength(0);
+                                                sawTransformedTextDelta.set(false);
+                                            }))
                     .doOnNext(
                             event -> {
                                 if (event instanceof TextBlockDeltaEvent textDelta) {
@@ -2533,55 +2561,90 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         private Flux<AgentEvent> modelCallStream(
                 ReasoningContext context, ModelCallInput mci, boolean withToolEvents) {
 
-            String replyId = UUID.randomUUID().toString().replace("-", "");
-            ModelCallBlockLifecycle blockLifecycle = new ModelCallBlockLifecycle(replyId);
+            // Attempt counter incremented on every (re-)subscription: the reasoning
+            // layer's incomplete-stream retry resubscribes this flux, and each attempt
+            // gets a fresh replyId + block lifecycle so consumers can distinguish and
+            // discard state from an aborted attempt (ModelCallStartEvent.attempt > 1).
+            AtomicInteger attempt = new AtomicInteger(0);
+            AtomicReference<String> replyIdRef = new AtomicReference<>("");
+            AtomicReference<ModelCallBlockLifecycle> blockLifecycleRef =
+                    new AtomicReference<>(new ModelCallBlockLifecycle(""));
 
             Flux<AgentEvent> modelEvents =
-                    mci.model().stream(mci.messages(), mci.tools(), mci.options())
-                            .concatMap(chunk -> checkInterrupted().thenReturn(chunk))
-                            .concatMap(
-                                    chunk ->
-                                            Flux.deferContextual(
-                                                    parentCtx -> {
-                                                        List<Msg> chunkMsgs =
-                                                                context.processChunk(chunk);
-                                                        for (Msg msg : chunkMsgs) {
-                                                            hookDispatcher
-                                                                    .fireReasoningChunk(
-                                                                            msg,
-                                                                            context,
-                                                                            mci.model()
-                                                                                    .getModelName())
-                                                                    .contextWrite(
-                                                                            ctx ->
-                                                                                    ctx.putAll(
-                                                                                            parentCtx))
-                                                                    .subscribe();
-                                                        }
+                    Flux.defer(
+                            () -> {
+                                String replyId = UUID.randomUUID().toString().replace("-", "");
+                                replyIdRef.set(replyId);
+                                blockLifecycleRef.set(new ModelCallBlockLifecycle(replyId));
+                                ModelCallBlockLifecycle blockLifecycle = blockLifecycleRef.get();
+                                return Flux.concat(
+                                        Flux.just(
+                                                new ModelCallStartEvent(
+                                                        replyId, attempt.incrementAndGet())),
+                                        mci.model().stream(
+                                                        mci.messages(), mci.tools(), mci.options())
+                                                .concatMap(
+                                                        chunk ->
+                                                                checkInterrupted()
+                                                                        .thenReturn(chunk))
+                                                .concatMap(
+                                                        chunk ->
+                                                                Flux.deferContextual(
+                                                                        parentCtx -> {
+                                                                            List<Msg> chunkMsgs =
+                                                                                    context
+                                                                                            .processChunk(
+                                                                                                    chunk);
+                                                                            for (Msg msg :
+                                                                                    chunkMsgs) {
+                                                                                hookDispatcher
+                                                                                        .fireReasoningChunk(
+                                                                                                msg,
+                                                                                                context,
+                                                                                                mci.model()
+                                                                                                        .getModelName())
+                                                                                        .contextWrite(
+                                                                                                ctx ->
+                                                                                                        ctx
+                                                                                                                .putAll(
+                                                                                                                        parentCtx))
+                                                                                        .subscribe();
+                                                                            }
 
-                                                        List<AgentEvent> events = new ArrayList<>();
-                                                        for (ContentBlock block :
-                                                                chunk.getContent()) {
-                                                            emitBlockEvents(
-                                                                    block,
-                                                                    context,
-                                                                    blockLifecycle,
-                                                                    withToolEvents,
-                                                                    events);
-                                                        }
-                                                        return Flux.fromIterable(events);
-                                                    }));
+                                                                            List<AgentEvent>
+                                                                                    events =
+                                                                                            new ArrayList<>();
+                                                                            for (ContentBlock
+                                                                                    block :
+                                                                                            chunk
+                                                                                                    .getContent()) {
+                                                                                emitBlockEvents(
+                                                                                        block,
+                                                                                        context,
+                                                                                        blockLifecycle,
+                                                                                        withToolEvents,
+                                                                                        events);
+                                                                            }
+                                                                            return Flux
+                                                                                    .fromIterable(
+                                                                                            events);
+                                                                        })));
+                            });
 
             Flux<AgentEvent> endEvents =
                     Flux.defer(
                             () -> {
                                 List<AgentEvent> events = new ArrayList<>();
-                                blockLifecycle.flushAll(events);
-                                events.add(new ModelCallEndEvent(replyId, context.getChatUsage()));
+                                blockLifecycleRef.get().flushAll(events);
+                                events.add(
+                                        new ModelCallEndEvent(
+                                                replyIdRef.get(),
+                                                context.getChatUsage(),
+                                                context.getFinishReason()));
                                 return Flux.fromIterable(events);
                             });
 
-            return Flux.concat(Flux.just(new ModelCallStartEvent(replyId)), modelEvents, endEvents);
+            return Flux.concat(modelEvents, endEvents);
         }
 
         private void emitBlockEvents(
@@ -3682,7 +3745,11 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                             () -> {
                                 List<AgentEvent> events = new ArrayList<>();
                                 blockLifecycle.flushAll(events);
-                                events.add(new ModelCallEndEvent(replyId, context.getChatUsage()));
+                                events.add(
+                                        new ModelCallEndEvent(
+                                                replyId,
+                                                context.getChatUsage(),
+                                                context.getFinishReason()));
                                 return Flux.fromIterable(events);
                             });
 

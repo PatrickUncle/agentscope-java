@@ -58,6 +58,9 @@ public class ReasoningContext {
     private int cachedTokens = 0;
     private double time = 0;
 
+    // Finish reason of the last chunk that carried one (provider's completion signal)
+    private String finishReason;
+
     // Provider-specific response metadata to propagate to the final message
     // (e.g. openai.reasoning.encrypted_content for reasoning replay)
     private final Map<String, Object> responseMetadata = new HashMap<>();
@@ -90,6 +93,11 @@ public class ReasoningContext {
             outputTokens = usage.getOutputTokens();
             cachedTokens = usage.getCachedTokens();
             time = usage.getTime();
+        }
+
+        // Track the provider's completion signal from the last chunk carrying one
+        if (chunk.getFinishReason() != null) {
+            finishReason = chunk.getFinishReason();
         }
 
         // Propagate provider-specific metadata
@@ -305,5 +313,33 @@ public class ReasoningContext {
                     .build();
         }
         return null;
+    }
+
+    /**
+     * Get the finish reason reported by the provider on the last chunk that carried one.
+     *
+     * @return finish reason (e.g. "stop", "length"), or null if never reported
+     */
+    public String getFinishReason() {
+        return finishReason;
+    }
+
+    /**
+     * Reset all per-attempt stream accumulation state (text, thinking, tool calls,
+     * streamed chunk history, message id, finish reason and provider metadata).
+     *
+     * <p>Called by the agent reasoning layer before re-subscribing to a model call
+     * whose stream ended abnormally (see {@code PartialStreamContent}), so the
+     * retried attempt's chunks replace — rather than append to — the aborted
+     * attempt's partial content when building the final message.
+     */
+    public void resetStreamState() {
+        textAcc.reset();
+        thinkingAcc.reset();
+        toolCallsAcc.reset();
+        allStreamedChunks.clear();
+        responseMetadata.clear();
+        messageId = null;
+        finishReason = null;
     }
 }
