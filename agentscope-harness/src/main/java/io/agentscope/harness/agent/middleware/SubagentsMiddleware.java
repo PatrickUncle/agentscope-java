@@ -170,6 +170,92 @@ public class SubagentsMiddleware implements HarnessRuntimeMiddleware {
             - **Cancel stale work**: Use task_cancel to stop background tasks that are no longer needed
             - Subagent results are NOT visible to the user — always summarize them in your response
             """;
+
+    // @formatter:on
+
+    // @formatter:off
+    /**
+     * Sync-only variant of {@link #SUBAGENT_SECTION_TEMPLATE}, rendered when the current call
+     * runs under {@code AgentSpawnTool.CTX_FORCE_SYNC} (the embedding platform has disabled
+     * fire-and-forget dispatch). Async-only machinery (task tools, background flow, timeout
+     * promotion) is deliberately absent: under force-sync it cannot trigger, and advertising it
+     * would teach the LLM to call tools that cannot produce background tasks. Instead this
+     * variant teaches the two things that DO matter in sync mode: same-turn parallel fan-out
+     * and timeout-resume via {@code agent_send}.
+     */
+    private static final String SUBAGENT_SYNC_SECTION_TEMPLATE =
+            """
+
+            ## Subagents
+
+            You have access to subagent tools for spawning and coordinating isolated subagents.
+            Subagents are ephemeral — they live only for the duration of the task and return a single result.
+
+            ### Agent Tools
+
+            **`%s`** — Spawn an isolated subagent
+            - `agent_id` (required): which subagent to instantiate
+            - `task` (optional): initial prompt; omit to create a persistent session
+            - `label` (optional): human-readable name for referencing via send
+            - Response always includes `agent_key:` (opaque handle) — save it for follow-up sends
+
+            **`%s`** — Send a follow-up message to an existing subagent
+            - `agent_key`: copy the **full value** after `agent_key:` from spawn output (starts with `agent:`). This is NOT `agent_id` and NOT `session_id`
+            - Or use `label` if you set one at spawn (mutually exclusive with agent_key)
+            - `message` (required): content to send
+
+            **`%s`** — List active subagents
+
+            ### Synchronous execution model (platform-enforced)
+            - ALL subagent calls run synchronously. `timeout_seconds=0` is disabled: it is
+              coerced to a sync wait. There are no background tasks here.
+            - **Parallelism**: multiple `agent_spawn` / `agent_send` calls emitted in the SAME
+              turn execute CONCURRENTLY (each with its own independent timeout window) — the
+              turn waits for the whole batch, then all results arrive together. To run
+              subagents in parallel you MUST emit all the calls in one turn; spawning one,
+              waiting, then spawning the next is sequential, not parallel.
+            - **Timeout**: if a call exceeds the sync wait, the subagent is interrupted and the
+              tool returns `status: timeout`. Its session state IS preserved. To resume, call
+              send with the same agent_key (message like "continue"); do NOT re-spawn a new
+              agent for the same task.
+
+            ### Available agent ids
+            %s
+
+            ### When to use subagents
+            - When a task is complex and multi-step, and can be fully delegated in isolation
+            - When a task is independent of other tasks and can run in parallel
+            - When a task requires focused reasoning or heavy context usage that would bloat the main thread
+            - When sandboxing improves reliability (e.g. code analysis, structured searches, data formatting)
+            - When you only care about the output, not the intermediate steps (e.g. research → synthesized report)
+
+            ### When NOT to use subagents
+            - If the task is trivial (a few tool calls or simple lookup)
+            - If you need to see intermediate reasoning or steps after completion
+            - If delegating does not reduce token usage, complexity, or context switching
+            - If splitting would add latency without benefit
+
+            ### Subagent lifecycle
+            1. **Spawn** → Provide clear role, instructions, and expected output format
+            2. **Run** → The subagent completes the task autonomously
+            3. **Return** → The subagent provides a single structured result
+            4. **Reconcile** → Incorporate or synthesize the result into the main thread
+
+            ### Usage patterns
+            - **Parallel fan-out (preferred)**: split independent work into N self-contained
+              subtasks and emit ALL `agent_spawn` calls in ONE turn — they run concurrently
+              with independent timeout windows and N tasks of ≤T minutes finish in ~T minutes,
+              not N×T. Prefer distinct subagent types per subtask when the work differs.
+            - **Sequential chaining**: when a later task needs earlier results, wait for the
+              current batch to return first, then spawn the next round (also fan out within
+              a round whenever the next steps are independent of each other).
+            - **Timeout resume**: on `status: timeout`, agent_send(same agent_key, "continue")
+              to resume from the preserved state — optionally batch several resumes in one
+              turn to keep waiting in parallel.
+            - **Persistent session**: Spawn without a task, then use send for multi-turn interaction
+            - Subagent results are NOT visible to the user — always summarize them in your response
+            """;
+
     // @formatter:on
 
     private final List<SubagentEntry> baseEntries;
@@ -432,7 +518,9 @@ public class SubagentsMiddleware implements HarnessRuntimeMiddleware {
         }
 
         StringBuilder addition = new StringBuilder();
-        addition.append(renderSubagentSection(currentEntries, isSessionMode));
+        addition.append(
+                renderSubagentSection(
+                        currentEntries, isSessionMode, AgentSpawnTool.isForceSync(rc)));
         String taskSummary = buildTaskSummary(this.taskRepository, rc);
         if (taskSummary != null) {
             addition.append(taskSummary);
@@ -647,6 +735,17 @@ public class SubagentsMiddleware implements HarnessRuntimeMiddleware {
      * without a declaration ({@code entry.declaration() == null}) are always shown.
      */
     public static String renderSubagentSection(List<SubagentEntry> entries, boolean isSessionMode) {
+        return renderSubagentSection(entries, isSessionMode, false);
+    }
+
+    /**
+     * Force-sync aware rendering: when the current call runs under {@code
+     * AgentSpawnTool.CTX_FORCE_SYNC}, the sync-only guidance template is used (no async task
+     * tools / background flow / timeout promotion — none of which can trigger under
+     * force-sync), keeping the injected prompt consistent with the tool's actual behavior.
+     */
+    public static String renderSubagentSection(
+            List<SubagentEntry> entries, boolean isSessionMode, boolean forceSync) {
         String agentList =
                 entries.stream()
                         .filter(SubagentsMiddleware::isVisibleToLlm)
@@ -655,7 +754,8 @@ public class SubagentsMiddleware implements HarnessRuntimeMiddleware {
         String spawnName = isSessionMode ? "sessions_spawn" : "agent_spawn";
         String sendName = isSessionMode ? "sessions_send" : "agent_send";
         String listName = isSessionMode ? "sessions_list" : "agent_list";
-        return String.format(SUBAGENT_SECTION_TEMPLATE, spawnName, sendName, listName, agentList);
+        String template = forceSync ? SUBAGENT_SYNC_SECTION_TEMPLATE : SUBAGENT_SECTION_TEMPLATE;
+        return String.format(template, spawnName, sendName, listName, agentList);
     }
 
     /**

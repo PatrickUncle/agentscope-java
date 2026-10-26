@@ -157,7 +157,9 @@ public class DynamicSubagentsMiddleware implements HarnessRuntimeMiddleware {
         }
         StringBuilder addition = new StringBuilder();
         if (!merged.isEmpty()) {
-            addition.append(SubagentsMiddleware.renderSubagentSection(merged, false));
+            addition.append(
+                    SubagentsMiddleware.renderSubagentSection(
+                            merged, false, AgentSpawnTool.isForceSync(rc)));
         }
         String taskSummary = SubagentsMiddleware.buildTaskSummary(taskRepository, rc);
         if (taskSummary != null) {

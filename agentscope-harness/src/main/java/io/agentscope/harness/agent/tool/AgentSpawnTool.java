@@ -1139,7 +1139,10 @@ public class AgentSpawnTool {
         return String.format(
                 """
                 status: timeout
-                The task exceeded the %ds sync timeout and was interrupted because force_sync                 is enabled. Background promotion is disabled for this call.\
+                The subagent exceeded the %ds sync wait and was interrupted. Its session \
+                state IS preserved. To resume, call agent_send with the agent_key above \
+                (message like 'continue'); do NOT re-spawn a new agent for the same task. \
+                Background promotion is disabled for this call.\
                 """,
                 timeoutMs / 1000);
     }
@@ -1148,13 +1151,19 @@ public class AgentSpawnTool {
      * Builds an {@link EventSource} for a freshly spawned or known subagent. The path is
      * constructed from the parent session ID (or {@code "main"} as fallback) plus the child's
      * {@code agentId}, separated by {@code "/"}.
+     *
+     * <p>A {@code #<spawn-suffix>} (the spawn key's unique tail) is appended so two CONCURRENT
+     * spawns of the SAME agentId (parallel same-turn fan-out) never collide on the event source:
+     * without it, both children share {@code <parent>/<agentId>} and downstream consumers that
+     * key active-subagent state by source path would overwrite each other (second Start evicts
+     * the first, first End closes both).
      */
     private EventSource buildChildSource(SpawnedAgent spawned, RuntimeContext parentCtx) {
         String parentName =
                 (parentCtx != null && parentCtx.getSessionId() != null)
                         ? parentCtx.getSessionId()
                         : "main";
-        String path = parentName + "/" + spawned.agentId();
+        String path = parentName + "/" + spawnPathSegment(spawned.agentId(), spawned.key());
         return EventSource.builder()
                 .agentKey(spawned.key())
                 .agentId(spawned.agentId())
@@ -1165,15 +1174,29 @@ public class AgentSpawnTool {
     }
 
     /**
-     * Builds a source path string for the {@link AgentEvent#withSource} tag. Uses the same
-     * parent-session / child-agent-id convention as {@link #buildChildSource}.
+     * Builds a {@code parentSession/agentId#spawn-suffix} source path for the {@link
+     * AgentEvent#withSource} tag. Uses the same uniqueness convention as {@link
+     * #buildChildSource}: same logical spawned instance always maps to the same path (stable
+     * across spawn → send → resume), distinct concurrent spawns of the same type stay distinct.
      */
     private String buildSourcePath(SpawnedAgent spawned, RuntimeContext parentCtx) {
         String parentName =
                 (parentCtx != null && parentCtx.getSessionId() != null)
                         ? parentCtx.getSessionId()
                         : "main";
-        return parentName + "/" + spawned.agentId();
+        return parentName + "/" + spawnPathSegment(spawned.agentId(), spawned.key());
+    }
+
+    /**
+     * Child path segment: {@code agentId#<tail-of-spawn-key>}. The spawn key is {@code
+     * agent:<agentId>:<uuid>} (ephemeral) or {@code agent:<agentId>:<deterministic-hash>}
+     * (persistent) — its tail after the last {@code ':'} is unique per spawned instance while
+     * stable for the instance's whole lifecycle.
+     */
+    static String spawnPathSegment(String agentId, String key) {
+        int idx = key != null ? key.lastIndexOf(':') : -1;
+        String tail = idx >= 0 && idx < key.length() - 1 ? key.substring(idx + 1) : "";
+        return tail.isEmpty() ? agentId : agentId + "#" + tail;
     }
 
     /**
@@ -1506,9 +1529,11 @@ public class AgentSpawnTool {
     }
 
     /**
-     * Whether {@link #CTX_FORCE_SYNC} is enabled on the current call.
+     * Whether {@link #CTX_FORCE_SYNC} is enabled on the current call. Public so embedding
+     * applications' middlewares (e.g. {@code SubagentsMiddleware}) can render matching sync-only
+     * guidance in the system prompt.
      */
-    static boolean isForceSync(RuntimeContext ctx) {
+    public static boolean isForceSync(RuntimeContext ctx) {
         if (ctx == null) {
             return false;
         }
