@@ -83,7 +83,12 @@ class WorkspaceSkillRepositoryTest {
             assertNotNull(loaded);
             assertEquals("csv-sum", loaded.getName());
             assertEquals("Sum CSV columns.", loaded.getDescription());
-            assertTrue(loaded.getSkillContent().contains("# CSV Sum"));
+            // head-only 契约: 正文经 resourcesFor 现读验证
+            assertTrue(
+                    repo.resourcesFor(loaded.getName(), null)
+                            .read("SKILL.md")
+                            .orElse("")
+                            .contains("# CSV Sum"));
         }
 
         @Test
@@ -202,7 +207,11 @@ class WorkspaceSkillRepositoryTest {
             assertTrue(repo.save(List.of(v2), true));
 
             AgentSkill loaded = repo.getSkill("dup");
-            assertTrue(loaded.getSkillContent().contains("# v2"));
+            assertTrue(
+                    repo.resourcesFor(loaded.getName(), null)
+                            .read("SKILL.md")
+                            .orElse("")
+                            .contains("# v2"));
         }
 
         @Test

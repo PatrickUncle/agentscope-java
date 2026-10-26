@@ -16,16 +16,14 @@
 package io.agentscope.core.skill;
 
 import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.skill.util.SkillFileSystemHelper;
 import io.agentscope.core.tool.AgentTool;
 import io.agentscope.core.tool.ToolCallParam;
 import io.agentscope.core.tool.Toolkit;
 import java.io.IOException;
-import java.nio.charset.MalformedInputException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -185,16 +183,20 @@ class SkillToolFactory {
             return buildResourceResponse(skillId, path, resources.get(path));
         }
 
-        // 2. Disk fallback via skill.originDir (lazy FS repos, or any FS-backed skill whose
-        //    in-memory map didn't preload the requested path). Same sanitisation rules as the
-        //    advertised path schema: no '..', no absolute path, no directories.
-        Optional<String> sanitized = sanitizeRelativePath(path);
-        if (sanitized.isPresent() && skill.getOriginDir().isPresent()) {
-            Optional<String> diskContent =
-                    readFromOriginDir(skill.getOriginDir().get(), sanitized.get());
-            if (diskContent.isPresent()) {
+        // 2. Disk fallback via skill.originDir (head-only/lazy FS repos, or any FS-backed
+        //    skill whose in-memory map didn't preload the requested path). 走共享现读通道,
+        //    含 512KB 护栏: 超限资源不进上下文, 返回路径提示改用 shell/read_file。
+        if (skill.getOriginDir().isPresent()) {
+            try {
+                Optional<String> diskContent =
+                        SkillFileSystemHelper.readResourceFromDir(skill.getOriginDir().get(), path);
+                if (diskContent.isPresent()) {
+                    activateSkill(skillId);
+                    return buildResourceResponse(skillId, path, diskContent.get());
+                }
+            } catch (SkillFileSystemHelper.ResourceTooLargeException e) {
                 activateSkill(skillId);
-                return buildResourceResponse(skillId, path, diskContent.get());
+                return buildResourceTooLargeMessage(skillId, e);
             }
         }
 
@@ -204,49 +206,12 @@ class SkillToolFactory {
                         skillId, path, resources, skill.getOriginDir().orElse(null)));
     }
 
-    private static Optional<String> sanitizeRelativePath(String path) {
-        if (path == null || path.isBlank()) {
-            return Optional.empty();
-        }
-        String normalized = path.replace('\\', '/');
-        if (normalized.startsWith("/") || normalized.contains("..")) {
-            return Optional.empty();
-        }
-        if (".".equals(normalized) || "./".equals(normalized)) {
-            return Optional.empty();
-        }
-        return Optional.of(normalized);
-    }
-
     /**
      * Reads a single file under {@code originDir} for the disk-fallback path. Text content is
      * returned as-is; binary content uses the {@code base64:} prefix convention that matches
      * {@code SkillFileSystemHelper.readAndPutResource}, so the load tool's contract is identical
      * whether the resource came from memory or disk.
      */
-    private static Optional<String> readFromOriginDir(Path originDir, String relPath) {
-        Path target = originDir.resolve(relPath).normalize();
-        if (!target.startsWith(originDir)) {
-            return Optional.empty();
-        }
-        if (!Files.isRegularFile(target) || !Files.isReadable(target)) {
-            return Optional.empty();
-        }
-        try {
-            return Optional.of(Files.readString(target, StandardCharsets.UTF_8));
-        } catch (MalformedInputException e) {
-            try {
-                byte[] bytes = Files.readAllBytes(target);
-                return Optional.of("base64:" + Base64.getEncoder().encodeToString(bytes));
-            } catch (IOException ex) {
-                logger.warn("Failed to read binary resource {}: {}", target, ex.getMessage());
-                return Optional.empty();
-            }
-        } catch (IOException e) {
-            logger.warn("Failed to read resource {}: {}", target, e.getMessage());
-            return Optional.empty();
-        }
-    }
 
     /**
      * Build response for SKILL.md content.
@@ -263,9 +228,33 @@ class SkillToolFactory {
         result.append("Source: ").append(skill.getSource()).append("\n\n");
         result.append("Content:\n");
         result.append("---\n");
-        result.append(skill.getSkillContent());
+        // head-only 技能正文不驻留: 经 originDir 磁盘现读原文
+        String content = skill.getSkillContent();
+        if (content == null && skill.getOriginDir().isPresent()) {
+            content = SkillFileSystemHelper.readFullMarkdownFromDir(skill.getOriginDir().get());
+        }
+        result.append(content != null ? content : "");
         result.append("\n---\n");
         return result.toString();
+    }
+
+    /**
+     * 资源超过内联上限时的提示: 给出文件绝对路径, 引导模型改用 shell/read_file
+     * 按路径处理 (大文件的正确消费方式是路径而非内容)。
+     */
+    private String buildResourceTooLargeMessage(
+            String skillId, SkillFileSystemHelper.ResourceTooLargeException e) {
+        return "Resource '"
+                + e.relPath
+                + "' in skill '"
+                + skillId
+                + "' is too large to inline ("
+                + (e.sizeBytes / 1024)
+                + "KB, limit "
+                + (SkillFileSystemHelper.MAX_INLINE_RESOURCE_BYTES / 1024)
+                + "KB).\nFile path: "
+                + e.file
+                + "\nUse shell or read_file with this path instead of loading its content.";
     }
 
     /**

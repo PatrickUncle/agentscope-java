@@ -279,6 +279,17 @@ public class SkillPromoter {
         sb.append("---\n");
         if (skill.getSkillContent() != null) {
             sb.append(skill.getSkillContent());
+        } else if (skill.getOriginDir().isPresent()) {
+            // head-only: 评审载荷所需正文经 originDir 现读 (瞬时, 用完即弃)
+            try {
+                String full =
+                        io.agentscope.core.skill.util.SkillFileSystemHelper.readFullMarkdownFromDir(
+                                skill.getOriginDir().get());
+                sb.append(
+                        io.agentscope.core.skill.util.MarkdownSkillParser.parse(full).getContent());
+            } catch (Exception e) {
+                // 读不到正文时保底输出仅元数据的候选, 评审会因缺内容拒绝
+            }
         }
         return sb.toString();
     }

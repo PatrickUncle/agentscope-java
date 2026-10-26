@@ -178,7 +178,7 @@ public class ClasspathSkillRepository implements AgentSkillRepository {
     @Override
     public AgentSkill getSkill(String skillName) {
         checkNotClosed();
-        return SkillFileSystemHelper.loadSkill(skillBasePath, skillName, source);
+        return SkillFileSystemHelper.loadSkillHead(skillBasePath, skillName, source);
     }
 
     /**
@@ -202,7 +202,9 @@ public class ClasspathSkillRepository implements AgentSkillRepository {
     @Override
     public List<AgentSkill> getAllSkills() {
         checkNotClosed();
-        return SkillFileSystemHelper.getAllSkills(skillBasePath, source);
+        // classpath 技能运行期不可变: 注册只留元数据 (head-only), 正文/资源按需现读,
+        // 统一"内存只留元数据"口径, 防未来内置技能携带大文本重演驻留问题
+        return SkillFileSystemHelper.getAllSkillHeads(skillBasePath, source);
     }
 
     @Override

@@ -121,6 +121,220 @@ public final class SkillFileSystemHelper {
     }
 
     /**
+     * 工具结果内联资源的体积上限。超过该值的资源不进对话上下文 (load 工具改回
+     * 文件路径并提示用 shell/read_file 处理), 防止大文件 (如 PPT 模板 base64)
+     * 一次性撑爆上下文与堆 — 2026-10-22 生产 520MB 驻留事故的护栏。
+     */
+    public static final long MAX_INLINE_RESOURCE_BYTES = 512 * 1024;
+
+    /** 资源超过 {@link #MAX_INLINE_RESOURCE_BYTES} 时由读取方法抛出, 调用方转提示。 */
+    public static final class ResourceTooLargeException extends RuntimeException {
+        /** 技能源目录内的相对路径。 */
+        public final String relPath;
+
+        /** 文件绝对路径, 供提示信息引用。 */
+        public final Path file;
+
+        /** 文件字节数。 */
+        public final long sizeBytes;
+
+        public ResourceTooLargeException(String relPath, Path file, long sizeBytes) {
+            super("resource too large: " + relPath + " (" + sizeBytes + " bytes)");
+            this.relPath = relPath;
+            this.file = file;
+            this.sizeBytes = sizeBytes;
+        }
+    }
+
+    /**
+     * head-only 加载技能: 瞬时读 SKILL.md 解析 name/description 后立即丢弃正文,
+     * 返回仅含元数据的 AgentSkill (正文/资源运行时经 originDir 磁盘现读)。
+     *
+     * <p>注册路径 (getAllSkills) 用它取代全量加载, 使技能常驻内存成本从
+     * "正文+全部资源 (可达 MB 级)" 降到元数据 (~KB 级)。
+     *
+     * @param skillDir The directory containing SKILL.md
+     * @param source The source identifier for the created skill
+     * @return head-only AgentSkill, {@code originDir} 指向 skillDir
+     */
+    public static AgentSkill loadSkillHead(Path skillDir, String source) {
+        Path skillFile = requireSkillFile(skillDir);
+        try {
+            String skillMdContent = Files.readString(skillFile, StandardCharsets.UTF_8);
+            ParsedMarkdown parsed = MarkdownSkillParser.parse(skillMdContent);
+            Map<String, Object> metadata = parsed.getMetadata();
+            if (parsed.getContent() == null || parsed.getContent().isEmpty()) {
+                throw new IllegalArgumentException(
+                        "The SKILL.md must have content except for the YAML Front Matter.");
+            }
+            return AgentSkill.headOf(
+                    metadata,
+                    source,
+                    skillDir.toAbsolutePath().normalize(),
+                    sha256Hex(skillMdContent));
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to load skill head from: " + skillDir, e);
+        }
+    }
+
+    /**
+     * head-only 加载 (按名解析目录), 供 getSkill 兜底路径使用, 与
+     * {@link #loadSkillHead(Path, String)} 同语义。
+     */
+    public static AgentSkill loadSkillHead(Path baseDir, String skillName, String source) {
+        Path skillDir =
+                findSkillDirectoryByName(baseDir, skillName)
+                        .orElseThrow(
+                                () ->
+                                        new IllegalArgumentException(
+                                                "Skill directory does not exist for skill name: "
+                                                        + skillName));
+        return loadSkillHead(skillDir, source);
+    }
+
+    /**
+     * head-only 批量加载: 目录下每个技能只解析 SKILL.md 元数据, 正文/资源不驻留。
+     * 与 {@link #getAllSkills(Path, String)} 对应的注册期瘦身版本。
+     */
+    public static List<AgentSkill> getAllSkillHeads(Path baseDir, String source) {
+        List<AgentSkill> skills = new ArrayList<>();
+        try (Stream<Path> subdirs = Files.list(baseDir)) {
+            subdirs.filter(Files::isDirectory)
+                    .forEach(
+                            dir -> {
+                                if (hasSkillFile(dir)) {
+                                    try {
+                                        skills.add(loadSkillHead(dir, source));
+                                    } catch (Exception e) {
+                                        logger.warn(
+                                                "Failed to load skill head from '{}': {}",
+                                                dir,
+                                                e.getMessage(),
+                                                e);
+                                    }
+                                }
+                            });
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to list skill directories", e);
+        }
+        return skills;
+    }
+
+    /**
+     * 磁盘现读技能的 SKILL.md 全文 (frontmatter + 正文原文)。
+     *
+     * <p>head-only 技能的 load_skill("SKILL.md") 与晋升/写回等需要正文的场景
+     * 统一走这里; 读原文而非重组, 保证与 skill_manage patch 的字节一致性。
+     *
+     * @param originDir 技能源目录
+     * @return SKILL.md 原文
+     */
+    public static String readFullMarkdownFromDir(Path originDir) {
+        try {
+            return Files.readString(requireSkillFile(originDir), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to read SKILL.md from: " + originDir, e);
+        }
+    }
+
+    /**
+     * 磁盘现读技能资源文件 (load_skill_through_path 的按需通道)。
+     *
+     * <p>文本按 UTF-8 原样返回; 二进制按 {@code base64:} 前缀约定编码, 与预加载
+     * 时代的资源 map 语义一致。超过 {@link #MAX_INLINE_RESOURCE_BYTES} 抛
+     * {@link ResourceTooLargeException}, 由调用方转为路径提示。
+     *
+     * @param originDir 技能源目录
+     * @param relPath 相对路径 (拒绝绝对路径与 "..")
+     * @return 内容; 文件不存在/不可读/路径非法时为 empty
+     */
+    public static Optional<String> readResourceFromDir(Path originDir, String relPath) {
+        if (relPath == null || relPath.isBlank()) {
+            return Optional.empty();
+        }
+        String normalized = relPath.replace('\\', '/');
+        if (normalized.startsWith("/") || normalized.contains("..")) {
+            return Optional.empty();
+        }
+        if (SKILL_FILE_NAME.equals(normalized)) {
+            return Optional.of(readFullMarkdownFromDir(originDir));
+        }
+        Path target = originDir.resolve(normalized).normalize();
+        if (!target.startsWith(originDir.normalize())) {
+            return Optional.empty();
+        }
+        if (!Files.isRegularFile(target) || !Files.isReadable(target)) {
+            return Optional.empty();
+        }
+        try {
+            long size = Files.size(target);
+            if (size > MAX_INLINE_RESOURCE_BYTES) {
+                throw new ResourceTooLargeException(normalized, target, size);
+            }
+            String content = Files.readString(target, StandardCharsets.UTF_8);
+            return Optional.of(content);
+        } catch (MalformedInputException e) {
+            try {
+                byte[] bytes = Files.readAllBytes(target);
+                if (bytes.length > MAX_INLINE_RESOURCE_BYTES) {
+                    throw new ResourceTooLargeException(normalized, target, bytes.length);
+                }
+                return Optional.of("base64:" + Base64.getEncoder().encodeToString(bytes));
+            } catch (IOException ex) {
+                logger.warn("Failed to read binary resource: {}", target, ex);
+                return Optional.empty();
+            }
+        } catch (IOException e) {
+            logger.warn("Failed to read resource: {}", target, e);
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * 列出技能目录下可作为资源的相对路径 (不含 SKILL.md 与隐藏文件),
+     * 供 load 工具的"未找到→列可选项"与技能集指纹使用。
+     */
+    public static List<String> listResourceRelPaths(Path skillDir) {
+        List<String> out = new ArrayList<>();
+        try (Stream<Path> walk = Files.walk(skillDir)) {
+            walk.filter(Files::isRegularFile)
+                    .filter(p -> !p.getFileName().toString().startsWith("."))
+                    .filter(p -> !p.getFileName().toString().equals(SKILL_FILE_NAME))
+                    .forEach(p -> out.add(skillDir.relativize(p).toString().replace('\\', '/')));
+        } catch (IOException e) {
+            logger.warn("Failed to list resources of: {}", skillDir, e);
+        }
+        out.sort(Comparator.naturalOrder());
+        return out;
+    }
+
+    private static String sha256Hex(String content) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest(content.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(d.length * 2);
+            for (byte b : d) {
+                hex.append(String.format("%02x", b));
+            }
+            return hex.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
+    }
+
+    private static Path requireSkillFile(Path skillDir) {
+        if (!Files.isDirectory(skillDir)) {
+            throw new IllegalArgumentException("Skill directory does not exist: " + skillDir);
+        }
+        Path skillFile = skillDir.resolve(SKILL_FILE_NAME);
+        if (!Files.exists(skillFile)) {
+            throw new IllegalArgumentException(
+                    "SKILL.md not found in skill directory: " + skillDir);
+        }
+        return skillFile;
+    }
+
+    /**
      * Retrieves all skill names by parsing SKILL.md metadata in each skill folder.
      *
      * @param baseDir The base directory containing skill folders

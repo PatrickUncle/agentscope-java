@@ -19,7 +19,6 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.skill.AgentSkill;
 import io.agentscope.core.skill.repository.AgentSkillRepository;
 import io.agentscope.core.skill.repository.AgentSkillRepositoryInfo;
-import io.agentscope.core.skill.util.SkillUtil;
 import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
 import io.agentscope.harness.agent.filesystem.model.FileDownloadResponse;
 import io.agentscope.harness.agent.filesystem.model.FileInfo;
@@ -193,10 +192,22 @@ public class WorkspaceSkillRepository
                 if (!rr.isSuccess() || rr.fileData() == null || rr.fileData().content() == null) {
                     continue;
                 }
-                // Resources are intentionally left null here; harness skill runtime resolves
-                // them lazily via resourcesFor(name, ctx) so per-call namespace switching is
-                // honored without preloading every byte.
-                skills.add(SkillUtil.createFrom(rr.fileData().content(), null, source));
+                // head-only: 只留元数据 + 正文摘要 (变更检测用), 正文/资源经
+                // resourcesFor(name, ctx) 现读 — per-call namespace 照旧生效,
+                // 且不再按 agent 驻留整份 SKILL.md
+                try {
+                    String md = rr.fileData().content();
+                    io.agentscope.core.skill.util.MarkdownSkillParser.ParsedMarkdown parsed =
+                            io.agentscope.core.skill.util.MarkdownSkillParser.parse(md);
+                    if (parsed.getContent() != null && !parsed.getContent().isEmpty()) {
+                        skills.add(
+                                AgentSkill.headOf(
+                                        parsed.getMetadata(), source, null, sha256Hex(md)));
+                    }
+                } catch (Exception parseEx) {
+                    log.warn(
+                            "Failed to parse skill head from '{}': {}", path, parseEx.getMessage());
+                }
             } catch (Exception e) {
                 log.warn("Failed to load skill from '{}': {}", path, e.getMessage());
             }
@@ -468,6 +479,20 @@ public class WorkspaceSkillRepository
      * {@code MarkdownSkillParser}, tolerant of whatever scalar/list/map metadata the
      * {@link AgentSkill} carries.
      */
+    private static String sha256Hex(String content) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest(content.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(d.length * 2);
+            for (byte b : d) {
+                hex.append(String.format("%02x", b));
+            }
+            return hex.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
+    }
+
     static String toMarkdown(AgentSkill skill) {
         DumperOptions options = new DumperOptions();
         options.setDefaultFlowStyle(DumperOptions.FlowStyle.BLOCK);
@@ -490,6 +515,17 @@ public class WorkspaceSkillRepository
 
         String fm = yaml.dump(ordered).trim();
         String body = skill.getSkillContent() != null ? skill.getSkillContent() : "";
+        if (body.isEmpty() && skill.getOriginDir() != null && skill.getOriginDir().isPresent()) {
+            // head-only 源经磁盘现读补正文, 避免写回时丢失内容
+            try {
+                String full =
+                        io.agentscope.core.skill.util.SkillFileSystemHelper.readFullMarkdownFromDir(
+                                skill.getOriginDir().get());
+                body = io.agentscope.core.skill.util.MarkdownSkillParser.parse(full).getContent();
+            } catch (Exception e) {
+                // 兜底空正文
+            }
+        }
         return "---\n" + fm + "\n---\n" + body;
     }
 

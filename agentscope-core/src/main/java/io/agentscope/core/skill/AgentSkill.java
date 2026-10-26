@@ -72,6 +72,13 @@ public class AgentSkill {
     private final String source;
 
     /**
+     * SKILL.md 正文的 SHA-256 摘要 (hex, 64B)。head-only 实例正文不驻留, 该摘要
+     * 供技能集指纹 (DynamicSkillMiddleware) 做变更检测 — 无 originDir 可枚举
+     * mtime 的懒源 (workspace 抽象文件系统) 依赖它感知正文编辑。
+     */
+    private final String contentDigest;
+
+    /**
      * Optional absolute path to the skill's on-disk source directory. When present, the prompt
      * provider can emit a {@code <files-root>} per skill so the LLM can shell-execute scripts
      * directly without going through {@code uploadSkillFiles}; the load tool can also use it as
@@ -170,6 +177,50 @@ public class AgentSkill {
         this.resources = resources != null ? new HashMap<>(resources) : new HashMap<>();
         this.source = source != null ? source : "custom";
         this.originDir = originDir;
+        this.contentDigest = null;
+    }
+
+    /**
+     * 构造"仅元数据"的技能对象 (head-only): 正文与资源不驻留内存, 运行时由
+     * 消费方经 {@code originDir} 磁盘现读 (load_skill / load_skill_through_path)。
+     *
+     * <p>用于技能注册路径的内存瘦身 — 注册进 Toolkit/技能列表只需要 name 与
+     * description, 正文与资源是回合内短暂使用的数据, 不应常驻。可空正文
+     * 仅允许出现在该工厂构造的实例上; 旧构造路径 (直接 new / createFrom)
+     * 的正文非空校验保持不变。
+     *
+     * @param metadata 含 {@code name} 与 {@code description} 的元数据 (必须)
+     * @param source 来源标识
+     * @param originDir 技能源目录; 磁盘现读的寻址根
+     * @return head-only AgentSkill, {@code getSkillContent()} 返回 null
+     */
+    public static AgentSkill headOf(Map<String, Object> metadata, String source, Path originDir) {
+        return headOf(metadata, source, originDir, null);
+    }
+
+    /**
+     * head-only 构造 (带正文摘要): digest 由加载方在瞬时读 SKILL.md 时计算,
+     * 供无磁盘路径场景的变更检测, 见 {@link #getContentDigest()}。
+     */
+    public static AgentSkill headOf(
+            Map<String, Object> metadata, String source, Path originDir, String contentDigest) {
+        String name = getRequiredMetadataString(metadata, "name");
+        String description = getRequiredMetadataString(metadata, "description");
+        LinkedHashMap<String, Object> metadataCopy = new LinkedHashMap<>(metadata);
+        metadataCopy.put("name", name);
+        metadataCopy.put("description", description);
+        return new AgentSkill(metadataCopy, source, originDir, contentDigest);
+    }
+
+    /** head-only 原始构造: 跳过正文非空校验 (仅供 {@link #headOf} 使用)。 */
+    private AgentSkill(
+            Map<String, Object> metadata, String source, Path originDir, String contentDigest) {
+        this.metadata = Collections.unmodifiableMap(new LinkedHashMap<>(metadata));
+        this.skillContent = null;
+        this.resources = new HashMap<>();
+        this.source = source != null ? source : "custom";
+        this.originDir = originDir;
+        this.contentDigest = contentDigest;
     }
 
     /**
@@ -214,10 +265,21 @@ public class AgentSkill {
      *
      * <p>This contains the actual skill implementation or instructions.
      *
-     * @return The skill content (never null)
+     * <p>head-only 实例 (经 {@link #headOf} 构造) 正文不驻留内存, 返回 null;
+     * 消费方应改经 originDir 磁盘现读 (见 SkillFileSystemHelper)。
+     *
+     * @return The skill content, or {@code null} for head-only instances
      */
     public String getSkillContent() {
         return skillContent;
+    }
+
+    /**
+     * SKILL.md 正文摘要 (head-only 实例有值; 驻留正文的实例为 null, 消费方可
+     * 自行对 getSkillContent 计算)。
+     */
+    public String getContentDigest() {
+        return contentDigest;
     }
 
     /**

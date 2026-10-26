@@ -18,6 +18,7 @@ package io.agentscope.harness.agent.skill.runtime;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.skill.AgentSkill;
 import io.agentscope.core.skill.util.MarkdownSkillParser;
+import io.agentscope.core.skill.util.SkillFileSystemHelper;
 import io.agentscope.core.tool.AgentTool;
 import io.agentscope.core.tool.ToolCallParam;
 import io.agentscope.harness.agent.skill.SkillResources;
@@ -214,6 +215,20 @@ public final class SkillLoadTool implements AgentTool {
             }
         }
 
+        // 3.5 originDir 磁盘现读 (head-only 的 FileSystem/Classpath repo 技能):
+        // 与 core SkillToolFactory 同款兜底, 含 512KB 护栏, 超限返回路径提示。
+        if (skill.getOriginDir().isPresent()) {
+            try {
+                Optional<String> disk =
+                        SkillFileSystemHelper.readResourceFromDir(skill.getOriginDir().get(), path);
+                if (disk.isPresent()) {
+                    return ToolResultBlock.text(formatResource(entry, path, disk.get()));
+                }
+            } catch (SkillFileSystemHelper.ResourceTooLargeException e) {
+                return ToolResultBlock.text(tooLargeHint(entry, e));
+            }
+        }
+
         // 4. Not found: enumerate both sources so the model sees real options.
         return ToolResultBlock.error(formatNotFound(entry, path));
     }
@@ -243,8 +258,20 @@ public final class SkillLoadTool implements AgentTool {
         // matches the bytes that skill_manage(action=patch) operates on. Returning body-only
         // (the previous behaviour) drove patch failures whenever the LLM tried to old_string
         // anything near the frontmatter boundary, since the parser eats that whitespace.
-        String fullMarkdown =
-                MarkdownSkillParser.generate(skill.getMetadata(), skill.getSkillContent());
+        // head-only 技能正文不驻留: originDir 现读原文 (字节级一致); 无磁盘路径的
+        // 懒源 (workspace 抽象文件系统) 经 lazyResources 读取; 都没有时退化为重组。
+        String fullMarkdown;
+        if (skill.getSkillContent() != null) {
+            fullMarkdown =
+                    MarkdownSkillParser.generate(skill.getMetadata(), skill.getSkillContent());
+        } else if (skill.getOriginDir().isPresent()) {
+            fullMarkdown =
+                    SkillFileSystemHelper.readFullMarkdownFromDir(skill.getOriginDir().get());
+        } else if (entry.lazyResources() != null) {
+            fullMarkdown = entry.lazyResources().read(SKILL_FILE).orElse("");
+        } else {
+            fullMarkdown = MarkdownSkillParser.generate(skill.getMetadata(), "");
+        }
         sb.append("\nContent (").append("SKILL.md").append("):\n");
         sb.append(CONTENT_FENCE).append("markdown\n");
         sb.append(fullMarkdown);
@@ -253,6 +280,22 @@ public final class SkillLoadTool implements AgentTool {
         }
         sb.append(CONTENT_FENCE).append("\n");
         return sb.toString();
+    }
+
+    /** 超限资源提示: 给文件路径, 引导改用 shell/read_file (大文件消费路径而非内容)。 */
+    private String tooLargeHint(
+            HarnessSkillEntry entry, SkillFileSystemHelper.ResourceTooLargeException e) {
+        return "Resource '"
+                + e.relPath
+                + "' in skill '"
+                + entry.skill().getSkillId()
+                + "' is too large to inline ("
+                + (e.sizeBytes / 1024)
+                + "KB, limit "
+                + (SkillFileSystemHelper.MAX_INLINE_RESOURCE_BYTES / 1024)
+                + "KB).\nFile path: "
+                + e.file
+                + "\nUse shell or read_file with this path instead of loading its content.";
     }
 
     private String formatResource(HarnessSkillEntry entry, String path, String content) {

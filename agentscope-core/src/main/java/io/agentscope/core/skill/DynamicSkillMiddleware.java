@@ -327,10 +327,24 @@ public class DynamicSkillMiddleware implements MiddlewareBase, ToolkitAware {
                 AgentSkill s = byName.get(name);
                 md.update(name.getBytes(StandardCharsets.UTF_8));
                 md.update((byte) 0);
-                md.update(
-                        s.getSkillContent() != null
-                                ? s.getSkillContent().getBytes(StandardCharsets.UTF_8)
-                                : new byte[0]);
+                if (s.getOriginDir().isPresent()) {
+                    // 磁盘承载 (head-only) 技能: 不读内容, 以文件清单 + size + mtime
+                    // 为指纹 — 等价语义且零内容扫描 (旧算法对驻留资源逐字节哈希,
+                    // head-only 实例 resources 为空, 且大资产哈希本身就是内存/CPU 浪费)
+                    hashDirManifest(md, s.getOriginDir().get());
+                    md.update((byte) 1);
+                    continue;
+                }
+                // head-only 无磁盘路径时用加载期摘要 (digest) 感知正文变更;
+                // 驻留正文的实例照旧哈希内容
+                if (s.getContentDigest() != null) {
+                    md.update(s.getContentDigest().getBytes(StandardCharsets.UTF_8));
+                } else {
+                    md.update(
+                            s.getSkillContent() != null
+                                    ? s.getSkillContent().getBytes(StandardCharsets.UTF_8)
+                                    : new byte[0]);
+                }
                 md.update((byte) 0);
                 Set<String> sortedResources = new TreeSet<>(s.getResources().keySet());
                 for (String key : sortedResources) {
@@ -341,8 +355,6 @@ public class DynamicSkillMiddleware implements MiddlewareBase, ToolkitAware {
                     }
                     md.update((byte) 0);
                 }
-                s.getOriginDir()
-                        .ifPresent(p -> md.update(p.toString().getBytes(StandardCharsets.UTF_8)));
                 md.update((byte) 1);
             }
             byte[] hash = md.digest();
@@ -353,6 +365,45 @@ public class DynamicSkillMiddleware implements MiddlewareBase, ToolkitAware {
             return hex.toString();
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 unavailable", e);
+        }
+    }
+
+    /**
+     * 目录清单指纹: 相对路径 + size + mtime, 不读文件内容。目录不可读时退化为
+     * 目录路径字符串, 保证签名仍确定。
+     */
+    private static void hashDirManifest(java.security.MessageDigest md, Path dir) {
+        try (var walk = Files.walk(dir)) {
+            walk.filter(Files::isRegularFile)
+                    .sorted()
+                    .forEach(
+                            f -> {
+                                md.update(
+                                        dir.relativize(f)
+                                                .toString()
+                                                .replace('\\', '/')
+                                                .getBytes(StandardCharsets.UTF_8));
+                                md.update((byte) 0);
+                                try {
+                                    var attrs =
+                                            Files.readAttributes(
+                                                    f,
+                                                    java.nio.file.attribute.BasicFileAttributes
+                                                            .class);
+                                    md.update(
+                                            Long.toString(attrs.size())
+                                                    .getBytes(StandardCharsets.UTF_8));
+                                    md.update((byte) 0);
+                                    md.update(
+                                            Long.toString(attrs.lastModifiedTime().toMillis())
+                                                    .getBytes(StandardCharsets.UTF_8));
+                                } catch (IOException e) {
+                                    md.update((byte) 0);
+                                }
+                                md.update((byte) 0);
+                            });
+        } catch (IOException e) {
+            md.update(dir.toString().getBytes(StandardCharsets.UTF_8));
         }
     }
 }
