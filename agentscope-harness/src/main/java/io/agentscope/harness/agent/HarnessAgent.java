@@ -1204,6 +1204,9 @@ public class HarnessAgent implements Agent, AutoCloseable {
         int maxIters = 10;
         ExecutionConfig modelExecutionConfig;
         ExecutionConfig toolExecutionConfig;
+        // Mirrors inner's permission context so the subagent factories can propagate the
+        // parent's permission mode to children (see HarnessAgentBuilderSupport).
+        PermissionContextState permissionContext;
         GenerateOptions generateOptions;
         final Set<Hook> hooks = new LinkedHashSet<>();
         final List<MiddlewareBase> middlewares = new ArrayList<>();
@@ -1238,6 +1241,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
         ArtifactDeliveryTarget artifactDeliveryTarget;
         boolean disableFilesystemTools = false;
         boolean disableShellTool = false;
+        boolean disableWebTools = false;
         boolean disableMemoryTools = false;
         boolean disableMemoryHooks = false;
         boolean disableTranscript = false;
@@ -1687,6 +1691,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
         }
 
         public Builder permissionContext(PermissionContextState permissionContext) {
+            this.permissionContext = permissionContext;
             inner.permissionContext(permissionContext);
             return this;
         }
@@ -2023,6 +2028,15 @@ public class HarnessAgent implements Agent, AutoCloseable {
         }
 
         /** Skips registration of {@link FilesystemTool}. */
+        /**
+         * 不注册内置 web_fetch / web_search (框架 WebTools)。宿主平台提供同名
+         * 增强版工具时使用, 避免同名覆盖造成的"创建即弃"实例与连接开销。
+         */
+        public Builder disableWebTools() {
+            this.disableWebTools = true;
+            return this;
+        }
+
         public Builder disableFilesystemTools() {
             this.disableFilesystemTools = true;
             return this;
@@ -2667,8 +2681,10 @@ public class HarnessAgent implements Agent, AutoCloseable {
             if (!disableShellTool && filesystem instanceof AbstractSandboxFilesystem sandbox) {
                 agentToolkit.registerTool(new ShellExecuteTool(sandbox));
             }
-            agentToolkit.registerTool(new WebTools.WebFetchTool());
-            agentToolkit.registerTool(new WebTools.WebSearchTool());
+            if (!disableWebTools) {
+                agentToolkit.registerTool(new WebTools.WebFetchTool());
+                agentToolkit.registerTool(new WebTools.WebSearchTool());
+            }
 
             // ---- Plan mode (read-only design phase) ----
             PlanModeManager planModeManager = null;

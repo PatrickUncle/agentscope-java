@@ -297,6 +297,13 @@ final class HarnessAgentBuilderSupport {
         final int capturedMaxIters = b.maxIters;
         final ExecutionConfig capturedModelExec = b.modelExecutionConfig;
         final ExecutionConfig capturedToolExec = b.toolExecutionConfig;
+        // Propagate the parent's permission context so children evaluate tools with the SAME
+        // mode the parent runs under. Without this a BYPASS-mode parent spawns children with a
+        // trivial DEFAULT context: non-readonly MCP tools' self-check (ask) then suspends the
+        // child's turn pending a confirmation nobody can answer (the child's HITL events are
+        // not surfaced by embedding apps), so any subagent touching MCP tools deadlocks.
+        final io.agentscope.core.permission.PermissionContextState capturedPermCtx =
+                b.permissionContext;
         final GenerateOptions capturedGenOpts = b.generateOptions;
         final String capturedEnvMemory = b.environmentMemory;
         final MemoryConfig capturedMemoryConfig = b.memoryConfig;
@@ -367,6 +374,7 @@ final class HarnessAgentBuilderSupport {
             if (capturedStateStore != null) sub.stateStore(capturedStateStore);
             if (capturedModelExec != null) sub.modelExecutionConfig(capturedModelExec);
             if (capturedToolExec != null) sub.toolExecutionConfig(capturedToolExec);
+            if (capturedPermCtx != null) sub.permissionContext(capturedPermCtx);
             if (capturedGenOpts != null) sub.generateOptions(capturedGenOpts);
             if (capturedDisableCompaction) {
                 sub.disableCompaction();
@@ -418,6 +426,11 @@ final class HarnessAgentBuilderSupport {
         // configured on the main agent.
         final ExecutionConfig capturedModelExec = b.modelExecutionConfig;
         final ExecutionConfig capturedToolExec = b.toolExecutionConfig;
+        // See buildGeneralPurposeFactory: children must evaluate tools under the parent's
+        // permission mode — a BYPASS parent must not spawn DEFAULT-mode children that ask
+        // for confirmation on non-readonly MCP tools (nobody can answer a child's HITL).
+        final io.agentscope.core.permission.PermissionContextState capturedPermCtx =
+                b.permissionContext;
         // Snapshot of main agent's Local filesystem configuration. ISOLATED subagents get a
         // fresh spec carrying the same project / additionalRoots / mode so PathPolicy stays in
         // sync; without this, every isolated subagent would default to project=${user.dir} and
@@ -497,6 +510,7 @@ final class HarnessAgentBuilderSupport {
 
             if (capturedModelExec != null) sub.modelExecutionConfig(capturedModelExec);
             if (capturedToolExec != null) sub.toolExecutionConfig(capturedToolExec);
+            if (capturedPermCtx != null) sub.permissionContext(capturedPermCtx);
 
             if (capturedDisableFilesystemTools) sub.disableFilesystemTools();
             if (capturedDisableShellTool) sub.disableShellTool();
@@ -810,7 +824,10 @@ final class HarnessAgentBuilderSupport {
         // Layer 1 (lowest priority): project-global skills directory.
         if (b.projectGlobalSkillsDir != null && Files.isDirectory(b.projectGlobalSkillsDir)) {
             try {
-                ordered.add(new FileSystemSkillRepository(b.projectGlobalSkillsDir));
+                // lazy(head-only): 注册只留元数据, 正文/资源经 originDir 现读
+                // (2026-10-22 内存事故: 全量预加载把带模板资产的技能按 agent 整份驻留)
+                ordered.add(
+                        new FileSystemSkillRepository(b.projectGlobalSkillsDir, true, null, true));
             } catch (Exception e) {
                 log.warn(
                         "Failed to register project-global skills dir {}: {}",
@@ -826,7 +843,8 @@ final class HarnessAgentBuilderSupport {
         Path workspaceSkillsDir = wsManager.getSkillsDir();
         if (workspaceSkillsDir != null && Files.isDirectory(workspaceSkillsDir)) {
             try {
-                ordered.add(new FileSystemSkillRepository(workspaceSkillsDir));
+                // 同上: head-only, 大资产技能不再进堆
+                ordered.add(new FileSystemSkillRepository(workspaceSkillsDir, true, null, true));
             } catch (Exception e) {
                 log.warn(
                         "Failed to load workspace skills from {}: {}",
