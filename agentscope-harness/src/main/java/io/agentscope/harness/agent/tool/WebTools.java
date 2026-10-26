@@ -35,9 +35,16 @@ public final class WebTools {
 
     private WebTools() {}
 
+    /**
+     * 进程级共享 HttpClient: JDK17 的 HttpClient 无 close(), 每 agent 实例化会在
+     * LRU 淘汰后遗留不可回收的 SelectorManager 线程 (2026-10-22 生产线程泄漏
+     * 实测 +36/15min)。工具实例照旧每 agent 创建, 但连接层全局一份。
+     */
+    private static final HttpClient SHARED_CLIENT =
+            HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build();
+
     public static final class WebFetchTool {
-        private final HttpClient client =
-                HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build();
+        private final HttpClient client = SHARED_CLIENT;
 
         @Tool(
                 name = "web_fetch",
@@ -83,8 +90,7 @@ public final class WebTools {
     public static final class WebSearchTool {
         private static final String TAVILY_API = "https://api.tavily.com/search";
         private final ObjectMapper mapper = new ObjectMapper();
-        private final HttpClient client =
-                HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build();
+        private final HttpClient client = SHARED_CLIENT;
 
         @Tool(
                 name = "web_search",
