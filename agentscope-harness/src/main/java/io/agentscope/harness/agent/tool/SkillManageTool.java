@@ -63,11 +63,14 @@ public class SkillManageTool implements AgentTool {
 
     public static final String NAME = "skill_manage";
 
-    // Validation constants (mirrored from hermes tools/skill_manager_tool.py)
+    // Validation constants (name/description limits mirrored from hermes
+    // tools/skill_manager_tool.py;
+    // content/file limits relaxed to sanity-guard level — a skill library should never be
+    // rejected on size, the caps only exist to stop runaway writes)
     static final int MAX_NAME_LENGTH = 64;
-    static final int MAX_DESCRIPTION_LENGTH = 1024;
-    static final int MAX_SKILL_CONTENT_CHARS = 100_000;
-    static final int MAX_SKILL_FILE_BYTES = 1_048_576; // 1 MiB
+    static final int MAX_DESCRIPTION_LENGTH = 8192;
+    static final int MAX_SKILL_CONTENT_CHARS = 1_000_000;
+    static final long MAX_SKILL_FILE_BYTES = 50L * 1024 * 1024; // 50 MiB
     static final Pattern VALID_NAME_RE = Pattern.compile("^[a-z0-9][a-z0-9._-]*$");
     static final Set<String> ALLOWED_SUBDIRS =
             Set.of("references", "templates", "scripts", "assets");

@@ -240,7 +240,13 @@ class SkillManageToolTest {
         assertFalse(text(r).startsWith("Error:"), text(r));
         var loaded = draftsRepo.getSkill("evolve");
         assertEquals("Updated.", loaded.getDescription());
-        assertTrue(loaded.getSkillContent().contains("Evolved"));
+        // head-only 契约: 正文经 resourcesFor 现读验证
+        assertTrue(
+                draftsRepo
+                        .resourcesFor("evolve", null)
+                        .read("SKILL.md")
+                        .orElse("")
+                        .contains("Evolved"));
     }
 
     // ---- patch ----
@@ -267,7 +273,12 @@ class SkillManageToolTest {
                         .block();
         assertFalse(text(r).startsWith("Error:"), text(r));
         var loaded = draftsRepo.getSkill("patchme");
-        assertTrue(loaded.getSkillContent().contains("Body v2."));
+        assertTrue(
+                draftsRepo
+                        .resourcesFor("patchme", null)
+                        .read("SKILL.md")
+                        .orElse("")
+                        .contains("Body v2."));
     }
 
     @Test
