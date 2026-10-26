@@ -1,3 +1,6 @@
+> **小海灵平台 fork**（基于上游 v2.0.3，Maven 版本 `2.0.3-xhl.N`）。分支/版本约定、相对上游的改动清单、
+> 构建与同步到宿主仓库的流程见 [小海灵fork说明.md](./小海灵fork说明.md)。以下为上游原 README。
+
 <p align="center">
   <img
     src="https://img.alicdn.com/imgextra/i1/O1CN01nTg6w21NqT5qFKH1u_!!6000000001621-55-tps-550-550.svg"
